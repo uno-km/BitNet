@@ -515,7 +515,72 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx, 
         }
     }
 #elif defined(__ARM_NEON)
+    // ====================================================================
+    // [Mobile Environment: ARM NEON / DotProd] - 1x4 32W Parallel Kernel
+    // Processes 4 parallel rows of X against 1 common row/col of Y with QK=128.
+    // ====================================================================
+    const uint8_t * x = (const uint8_t *)vx;
+    const int8_t  * y = (const int8_t  *)vy;
+    const int QK = 128;
+    const int nb = n / QK;
+    const uint8x16_t mask = vdupq_n_u8(0x03);
 
+    for (int row = 0; row < nrc; row += 4) {
+        int cur_p = (row + 4 <= nrc) ? 4 : (nrc - row);
+        int32x4_t accu[4];
+        const uint8_t * x_row[4];
+        for (int rb = 0; rb < cur_p; rb++) {
+            accu[rb] = vdupq_n_s32(0);
+            x_row[rb] = x + (row + rb) * bx / 4;
+        }
+
+        for (int b = 0; b < nb; b++) {
+            const int8_t * py = y + b * QK;
+
+            for (int j = 0; j < 2; j++) {
+                int k = j * 16;
+                int8x16_t y0 = vld1q_s8(py + k + 0*32);
+                int8x16_t y1 = vld1q_s8(py + k + 1*32);
+                int8x16_t y2 = vld1q_s8(py + k + 2*32);
+                int8x16_t y3 = vld1q_s8(py + k + 3*32);
+
+                for (int rb = 0; rb < cur_p; rb++) {
+                    const uint8_t * px = x_row[rb] + b * 32;
+                    uint8x16_t xb = vld1q_u8(px + k);
+
+                    int8x16_t v0 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xb, 6), mask));
+                    int8x16_t v1 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xb, 4), mask));
+                    int8x16_t v2 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(xb, 2), mask));
+                    int8x16_t v3 = vreinterpretq_s8_u8(vandq_u8(xb, mask));
+
+#if defined(__ARM_FEATURE_DOTPROD)
+                    accu[rb] = vdotq_s32(accu[rb], v0, y0);
+                    accu[rb] = vdotq_s32(accu[rb], v1, y1);
+                    accu[rb] = vdotq_s32(accu[rb], v2, y2);
+                    accu[rb] = vdotq_s32(accu[rb], v3, y3);
+#else
+                    int16x8_t accula = vdupq_n_s16(0);
+                    accula = vmlal_s8(accula, vget_low_s8(v0), vget_low_s8(y0));
+                    accula = vmlal_s8(accula, vget_high_s8(v0), vget_high_s8(y0));
+                    accula = vmlal_s8(accula, vget_low_s8(v1), vget_low_s8(y1));
+                    accula = vmlal_s8(accula, vget_high_s8(v1), vget_high_s8(y1));
+                    accula = vmlal_s8(accula, vget_low_s8(v2), vget_low_s8(y2));
+                    accula = vmlal_s8(accula, vget_high_s8(v2), vget_high_s8(y2));
+                    accula = vmlal_s8(accula, vget_low_s8(v3), vget_low_s8(y3));
+                    accula = vmlal_s8(accula, vget_high_s8(v3), vget_high_s8(y3));
+
+                    accu[rb] = vaddq_s32(accu[rb], vmovl_s16(vget_low_s16(accula)));
+                    accu[rb] = vaddq_s32(accu[rb], vmovl_high_s16(accula));
+#endif
+                }
+            }
+        }
+
+        for (int rb = 0; rb < cur_p; rb++) {
+            int32_t sumi = vaddvq_s32(accu[rb]);
+            s[row + rb] = (float)sumi;
+        }
+    }
 #endif
 }
 
